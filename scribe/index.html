@@ -1,0 +1,100 @@
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Judge Scribe</title>
+<style>
+:root{--bg:#111;--fg:#eee;--mut:#888;--acc:#e5484d;--ok:#3fb950;--card:#1c1c1c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px -apple-system,system-ui,sans-serif;padding:16px;max-width:600px;margin:auto}
+select,input,textarea,button{font:inherit;width:100%;padding:12px;border-radius:10px;border:1px solid #333;background:var(--card);color:var(--fg)}
+.row{display:flex;gap:8px;margin-bottom:10px}.row>*{flex:1}
+#rec{height:90px;font-size:24px;font-weight:700;background:#222;border:2px solid #444;margin:6px 0 10px}
+#rec.on{background:var(--acc);border-color:var(--acc)}
+#status{color:var(--mut);font-size:14px;margin-bottom:10px}
+#status b{color:var(--fg)}
+#tail{white-space:pre-wrap;font-size:14px;color:#ccc;background:var(--card);padding:10px;border-radius:10px;max-height:40vh;overflow:auto}
+h1{font-size:18px;margin:0 0 12px}
+</style></head><body>
+<h1>Judge Scribe</h1>
+<div class="row"><select id="pick"></select></div>
+<div class="row"><input id="newname" placeholder="new project name"><button id="add" style="flex:0 0 80px">Add</button></div>
+<div class="row"><select id="mic"><option value="">default mic</option></select></div>
+<button id="newbtn" style="display:none;background:#1f6feb;border-color:#1f6feb;font-weight:700;margin-bottom:6px"></button>
+<button id="rec">● Record</button>
+<div id="status">idle</div>
+<div class="row"><textarea id="note" rows="2" placeholder="quick note…"></textarea></div>
+<div class="row"><button id="send">Save note</button></div>
+<div id="tail"></div>
+<script>
+const $=id=>document.getElementById(id);
+const CHUNK_MS=15000;
+let project=localStorage.getItem('project')||'', stream=null, rec=null, on=false, timer=null, wake=null;
+
+// ---- durable upload queue (IndexedDB): survives wifi drops and page reloads
+let db;
+const dbReady=new Promise(r=>{const q=indexedDB.open('scribe',1);q.onupgradeneeded=()=>q.result.createObjectStore('q',{autoIncrement:true});q.onsuccess=()=>{db=q.result;r()};q.onerror=()=>r()});
+async function enqueue(item){await dbReady;if(!db){return send(item)}
+  return new Promise(r=>{const t=db.transaction('q','readwrite');t.objectStore('q').add(item);t.oncomplete=()=>{r();flush()}})}
+function all(){return new Promise(r=>{const out=[];const t=db.transaction('q');const c=t.objectStore('q').openCursor();c.onsuccess=()=>{const x=c.result;if(x){out.push([x.key,x.value]);x.continue()}else r(out)}})}
+function del(k){return new Promise(r=>{const t=db.transaction('q','readwrite');t.objectStore('q').delete(k);t.oncomplete=r})}
+async function send(it){const u=`/${it.kind}?project=${encodeURIComponent(it.project)}&ts=${it.ts}&ext=${it.ext||''}`;
+  const r=await fetch(u,{method:'POST',body:it.body});if(!r.ok)throw new Error(r.status)}
+let flushing=false, pending=0, lastErr='';
+async function flush(){if(flushing||!db)return;flushing=true;
+  try{const items=await all();pending=items.length;
+    for(const [k,it] of items){try{await send(it);await del(k);pending--;lastErr=''}catch(e){lastErr='offline – will retry';break}}}
+  finally{flushing=false;show()}}
+setInterval(flush,3000);
+
+// ---- projects
+let known=null, meta={};
+const label=p=>(meta[p]&&meta[p].name&&meta[p].name!==p)?`${meta[p].name} (${p})`:p;
+async function loadProjects(){try{const r=await (await fetch('/projects')).json();meta=r.meta||{};
+  const fresh=known?r.projects.filter(p=>!known.has(p)):[];known=new Set(r.projects);
+  $('pick').innerHTML='<option value="">— pick project —</option>'+r.projects.map(p=>`<option value="${p}" ${p===project?'selected':''}>${label(p)}</option>`).join('');
+  if(fresh.length){const n=fresh[0];
+    if(!on&&n!==project)setProject(n);           // idle: jump to the new project
+    else if(n!==project){$('newbtn').textContent='NEW: '+label(n)+' — tap to switch';$('newbtn').dataset.p=n;$('newbtn').style.display='block';navigator.vibrate&&navigator.vibrate(200)}}
+}catch(e){}}
+setInterval(loadProjects,10000);
+$('newbtn').onclick=()=>{setProject($('newbtn').dataset.p);$('pick').value=project;$('newbtn').style.display='none'};
+function setProject(p){project=p;localStorage.setItem('project',p);if(on)cut();tail();show()}
+$('pick').onchange=e=>setProject(e.target.value);
+$('add').onclick=async()=>{const n=$('newname').value.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');if(!n)return;
+  await enqueue({kind:'note',project:n,ts:Date.now(),body:'(folder created)'});$('newname').value='';
+  const o=document.createElement('option');o.textContent=n;$('pick').prepend(o);$('pick').value=n;setProject(n)};
+
+// ---- recording: restart MediaRecorder every CHUNK_MS so each chunk is a standalone file
+const mime=['audio/webm;codecs=opus','audio/mp4','audio/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
+const ext=mime.includes('mp4')?'m4a':'webm';
+function startChunk(){const p=project, ts=Date.now();rec=new MediaRecorder(stream,mime?{mimeType:mime}:{});const parts=[];
+  rec.ondataavailable=e=>e.data.size&&parts.push(e.data);
+  rec.onstop=()=>{const b=new Blob(parts,{type:mime});if(b.size>2000)enqueue({kind:'chunk',project:p,ts,ext,body:b});if(on)startChunk()};
+  rec.start();clearTimeout(timer);timer=setTimeout(cut,CHUNK_MS)}
+function cut(){if(rec&&rec.state==='recording')rec.stop()}
+$('rec').onclick=async()=>{
+  if(!project){alert('pick a project first');return}
+  if(!on){try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:true,...($('mic').value?{deviceId:{exact:$('mic').value}}:{})}})}catch(e){alert('mic blocked: '+e.message);return}
+    on=true;startChunk();try{wake=await navigator.wakeLock.request('screen')}catch(e){}}
+  else{on=false;clearTimeout(timer);cut();stream.getTracks().forEach(t=>t.stop());wake&&wake.release()}
+  show()};
+document.addEventListener('visibilitychange',async()=>{if(on&&document.visibilityState==='visible'){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}});
+
+// ---- notes
+$('send').onclick=async()=>{const t=$('note').value.trim();if(!t||!project)return;await enqueue({kind:'note',project,ts:Date.now(),body:t});$('note').value=''};
+
+// ---- status + transcript tail
+let q=0;
+function show(){$('rec').className=on?'on':'';$('rec').textContent=on?'■ Stop':'● Record';
+  $('status').innerHTML=`<b>${project||'no project'}</b> · ${on?'recording':'idle'} · upload queue ${pending} · transcribing ${q}${lastErr?' · '+lastErr:''}`}
+async function tail(){if(!project)return;try{const r=await (await fetch('/tail?project='+encodeURIComponent(project))).json();q=r.queue;
+  const el=$('tail');const atBottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=r.text||'(no transcript yet)';if(atBottom)el.scrollTop=el.scrollHeight}catch(e){}show()}
+setInterval(tail,5000);
+// ---- mic picker (labels need permission once)
+async function loadMics(){try{let d=await navigator.mediaDevices.enumerateDevices();
+  if(!d.some(x=>x.kind==='audioinput'&&x.label)){const s=await navigator.mediaDevices.getUserMedia({audio:true});s.getTracks().forEach(t=>t.stop());d=await navigator.mediaDevices.enumerateDevices()}
+  const saved=localStorage.getItem('mic')||'';
+  $('mic').innerHTML='<option value="">default mic</option>'+d.filter(x=>x.kind==='audioinput'&&x.deviceId!=='default').map(x=>`<option value="${x.deviceId}" ${x.deviceId===saved?'selected':''}>${x.label||'mic'}</option>`).join('')}catch(e){}}
+$('mic').onchange=()=>localStorage.setItem('mic',$('mic').value);
+navigator.mediaDevices&&navigator.mediaDevices.addEventListener('devicechange',loadMics);
+loadMics();loadProjects();tail();show();flush();
+</script></body></html>

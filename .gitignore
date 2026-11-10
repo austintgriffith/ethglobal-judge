@@ -1,0 +1,8 @@
+.env
+events/
+projects/
+SCOREBOARD.md
+event.md
+.scribe-*.pem
+__pycache__/
+.DS_Store
